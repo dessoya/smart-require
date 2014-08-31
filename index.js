@@ -7,13 +7,27 @@ var util		= require('util')
 
 var lib_paths = process.env.NODE_PATH.split(':')
 var modules = { 'smart-require': { exports: startup } }, filesMap = { }, config = { debug: { } }
-var loadKey = '', debugPrefixRE = /^\s*\/\*\s*debug(?:\:())?\s+(start|end)\s*\*\//
+var loadKey = '', debugPrefixRE = /^\s*\/\*\s*debug\:\s+([a-zA-Z\d\-\._]+)\s*/
+var debugEndPrefixRE = /^\s*\*\//
+var debugVarRE = /\%([a-zA-Z\d\-_]+)\%/
 var cleanPathRE = /\((\/[a-zA-Z-_\d\.\/]+)\:(\d+)\:(\d+)\)/
 
-function allowDebugTags(tags) {
-	if('debug' in config) {
-		return true
+global.debugConsoleMarker = function(marker) {
+	return '[' + marker + '] '
+}
+
+function allowDebugTags(tag) {
+
+	if(!('debugList' in config)) {
+		config.debugList = config.debug.length > 0 ? config.debug.split(',') : []
 	}
+
+	var c = config.debugList, l = c.length; while(l--) {
+		var t = c[l]
+		if('*' === t) return true
+		if(tag.length >= t.length && tag.substr(0, t.length) === t) return true
+	}
+
 	return false
 }
 
@@ -26,11 +40,12 @@ function Parser(path) {
 	var body = '' + fs.readFileSync(path), state = 0, debugTags = 0, a
 	this.lines = body.split('\n')
 	this.parsed = []	
-	this.linesMap = {}
-	this.p1 = this.p2 = 1
+
+	var openDebugSection = false
 
 	while(this.lines.length) {
 		var line = this.lines.shift()
+		line = line.replace(/[\r\n]+$/, '')
 		switch(state) {
 
 		// reading
@@ -38,7 +53,14 @@ function Parser(path) {
 			if(a = debugPrefixRE.exec(line)) {
 				state = 1
 				debugTags = a[1]
-				if(allowDebugTags(debugTags)) this.pushLine(line)
+				if(allowDebugTags(debugTags)) {
+					this.currentTag = debugTags
+					openDebugSection = true
+					this.pushLine(line + ' */')
+				}
+				else {
+					this.pushLine(line)
+				}
 			}
 			else {
 				this.pushLine(line)
@@ -46,27 +68,41 @@ function Parser(path) {
 		break
 
 		case 1:
-			if(a = debugPrefixRE.exec(line)) {
-				if(allowDebugTags(debugTags)) this.pushLine(line)
+			if(openDebugSection && (a = debugEndPrefixRE.exec(line))) {
+				this.pushLine('')
 				state = 0
+				openDebugSection = false
 			}
 			else {
-				if(allowDebugTags(debugTags)) this.pushLine(line)
+				if(openDebugSection) {
+					this.pushLine(this.parseDebugLine(line))
+				}
+				else {
+					this.pushLine(line)
+				}
 			}
 			break
 		}
-		this.p1 ++
 	}
 
 	this.content = this.parsed.join('\n')
-	this.linesMap = JSON.stringify(this.linesMap)
+	// this.linesMap = JSON.stringify(this.linesMap)
 }
 
 Parser.prototype = {
+
 	pushLine: function(line) {
 		this.parsed.push(line)
-		this.linesMap[this.p2] = this.p1
-		this.p2 ++
+	},
+
+	parseDebugLine: function(line) {
+		var a = debugVarRE.exec(line)
+		if(a) {
+			if(a[1] === 'dt') {
+				line = line.substr(0, a.index) + 'debugConsoleMarker("' + this.currentTag + '")' + line.substr(a.index + a[0].length)
+			}
+		}
+		return line
 	}
 }
 
@@ -74,6 +110,10 @@ function smartRequire(module) {
 
 	// var formattedModule = module[0] !== '.' ? module.replace(/\/\.\//g, '\/') : module
 	var formattedModule = module
+
+	if(formattedModule in modules) {
+		return modules[formattedModule].exports
+	}
 	// stage 1. format
 	var filePath = null, err = new Error(), stack = err.stack.split('\n')
 	if(formattedModule[0] === '.') {
@@ -161,7 +201,7 @@ function smartRequire(module) {
 
 			var parser = new Parser(filePath)
 			
-			fs.writeFileSync(cacheFile + '.lines', parser.linesMap)
+			// fs.writeFileSync(cacheFile + '.lines', parser.linesMap)
 			fs.writeFileSync(cacheFile, parser.content)
 
 			fs.utimesSync(cacheFile, Math.floor(mtime / 1000), Math.floor(mtime / 1000))
@@ -182,6 +222,7 @@ function smartRequire(module) {
 	return moduleObject.exports
 }
 
+/*
 global.getCallerFilePath = function() {
 	var err = new Error(), stack = err.stack.split('\n'), path = cleanPathRE.exec(stack[3])[1]
 	// console.dir(stack)
@@ -189,24 +230,8 @@ global.getCallerFilePath = function() {
 	// if(path in filesMap) path = filesMap[path]
 	return path
 }
+*/
 
-global.processStack = function(stack) {
-
-	stack = stack.split('\n')
-
-	for(var a, i = 0, l = stack.length; i < l; i++) {
-		var line = stack[i]
-		if(a = cleanPathRE.exec(line)) {
-			var file = a[1]
-			if(file in filesMap) {			
-				var linesMap = JSON.parse('' + fs.readFileSync(filesMap[file]+'.lines'))
-				stack[i] = line.substr(0, a.index + 1) + file + ':' + linesMap[parseInt(a[2])] + ':' + a[3] + ')' + line.substr(a.index + a[0].length)
-			}
-		}
-	}
-
-	return stack.join('\n')
-}
 
 function Module(path, titlePath) {
 	this.path = path
@@ -222,25 +247,23 @@ Module.prototype = {
 	}
 }
 
-function startup(application) {
-	var err = new Error(), stack = err.stack.split('\n'), path
-	if(stack[2].indexOf('eval') !== -1) {
-		path = process.cwd()
-	}
-	else {
-		path = cleanPathRE.exec(stack[2])[1].replace(/\/[^\/]+$/, '')
-	}
-	var module = new Module(path  + '/' + application)
-	module.loadAndExecuteScript()
-}
 
-startup.originalRequire = require
-startup.setConfig = function(_config) {
+function startup(_config) {
 	config = _config
 	if(!fs.existsSync(config.cachePath)) {
 		fs.mkdirSync(config.cachePath)
 	}
 	makeLoadKey()
+	console.log('loadKey '+loadKey)
+	return smartRequire
+}
+
+startup.originalRequire = require
+startup.filenameFromStack = function(depth, dontClean) {
+	var err = new Error(), stack = err.stack.split('\n')
+	// console.log(stack.join('\n'))
+	var path = dontClean ? stack[depth + 1].replace(/^\s+/,'') : cleanPathRE.exec(stack[depth + 1])[1]
+	return path
 }
 
 module.exports = startup
